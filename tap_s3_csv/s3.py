@@ -9,7 +9,7 @@ import more_itertools
 import re
 import backoff
 import boto3
-import io
+import io as jio
 
 from botocore.exceptions import ClientError
 from singer_encodings.csv import get_row_iterator, SDC_EXTRA_COLUMN  # pylint:disable=no-name-in-module
@@ -339,6 +339,6 @@ def get_file_handle(config: Dict, s3_path: str) -> Iterator:
     return s3_object.get()['Body']
 
 def stream_zip_decompress(stream):
-    buffer = io.BytesIO(stream.read())
+    buffer = jio.BytesIO(stream.read())
     z = zipfile.ZipFile(buffer)
     return z.open(z.infolist()[0])
