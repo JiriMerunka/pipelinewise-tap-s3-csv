@@ -3,21 +3,22 @@ Modules containing all AWS S3 related features
 """
 from __future__ import division
 
-import os
 import itertools
-import more_itertools
 import re
+from typing import Dict, Generator, Optional, Iterator
+
 import backoff
 import boto3
-import io as jio
+import copy
+import singer
+import io
+import zipfile
 
 from botocore.exceptions import ClientError
 from singer_encodings.csv import get_row_iterator, SDC_EXTRA_COLUMN  # pylint:disable=no-name-in-module
-from singer import get_logger, utils
-from typing import Dict, Generator, Optional, Iterator, List
+from tap_s3_csv import conversion
 
-
-LOGGER = get_logger('tap_s3_csv')
+LOGGER = singer.get_logger()
 
 SDC_SOURCE_BUCKET_COLUMN = "_sdc_source_bucket"
 SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
@@ -51,24 +52,12 @@ def setup_aws_client(config: Dict) -> None:
     Initialize a default AWS session
     :param config: connection config
     """
+    aws_access_key_id = config['aws_access_key_id']
+    aws_secret_access_key = config['aws_secret_access_key']
+
     LOGGER.info("Attempting to create AWS session")
-
-    # Get the required parameters from config file and/or environment variables
-    aws_access_key_id = config.get('aws_access_key_id') or os.environ.get('AWS_ACCESS_KEY_ID')
-    aws_secret_access_key = config.get('aws_secret_access_key') or os.environ.get('AWS_SECRET_ACCESS_KEY')
-    aws_session_token = config.get('aws_session_token') or os.environ.get('AWS_SESSION_TOKEN')
-    aws_profile = config.get('aws_profile') or os.environ.get('AWS_PROFILE')
-
-    # AWS credentials based authentication
-    if aws_access_key_id and aws_secret_access_key:
-        boto3.setup_default_session(
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            aws_session_token=aws_session_token
-        )
-    # AWS Profile based authentication
-    else:
-        boto3.setup_default_session(profile_name=aws_profile)
+    boto3.setup_default_session(aws_access_key_id=aws_access_key_id,
+                                aws_secret_access_key=aws_secret_access_key)
 
 
 def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:
@@ -80,8 +69,7 @@ def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:
     """
     LOGGER.info('Sampling records to determine table schema.')
 
-    modified_since = utils.strptime_with_tz(config['start_date'])
-    s3_files_gen = get_input_files_for_table(config, table_spec, modified_since)
+    s3_files_gen = get_input_files_for_table(config, table_spec)
 
     samples = list(sample_files(config, table_spec, s3_files_gen))
 
@@ -95,34 +83,12 @@ def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:
         SDC_EXTRA_COLUMN: {'type': 'array', 'items': {'type': 'string'}},
     }
 
-    data_schema = generate_schema(samples, table_spec)
+    data_schema = conversion.generate_schema(samples, table_spec)
 
     return {
         'type': 'object',
         'properties': merge_dicts(data_schema, metadata_schema)
     }
-
-
-def generate_schema(samples: List[Dict], table_spec: Dict) -> Dict:
-    """
-    Build json schema, all columns in the headers would be string.
-    with format date-time if date_overrides has been configured for the table.
-
-    :param samples: List of dictionaries containing samples data from csv file(s)
-    :param table_spec: table/stream specs given in the tap definition
-    :return: json schema dictionary representing  the table
-    """
-    schema = {}
-    date_overrides = set(table_spec.get('date_overrides', []))
-
-    for sample in samples:
-        for header in sample.keys():
-            schema[header] = {'type': ['null', 'string']}
-
-            if header in date_overrides:
-                schema[header]['format'] = 'date-time'
-
-    return schema
 
 
 def merge_dicts(first: Dict, second: Dict) -> Dict:
@@ -147,7 +113,7 @@ def merge_dicts(first: Dict, second: Dict) -> Dict:
     return to_return
 
 
-def sample_file(config: Dict, table_spec: Dict, s3_path: str, sample_rate: int) -> Generator:
+def sample_file(config, table_spec, s3_path, sample_rate):
     """
     Get a sample data from the given S3 file
     :param config:
@@ -156,17 +122,21 @@ def sample_file(config: Dict, table_spec: Dict, s3_path: str, sample_rate: int) 
     :param sample_rate:
     :return: generator containing the samples as dictionaries
     """
-    file_handle = get_file_handle(config, s3_path)
-     # _raw_stream seems like the wrong way to access this..    
-    # if csv is zipped, unzip it
-    stream = None
-    if s3_path.endswith('zip') or s3_path.endswith('gz'):
-        LOGGER.info('decompress stream')
-        stream = stream_zip_decompress(file_handle._raw_stream)
-    else:
-        stream = file_handle._raw_stream
-        
-    iterator = get_row_iterator(file_handle._raw_stream, table_spec)  # pylint:disable=protected-access
+    file_stream = get_file_stream(config, s3_path)
+
+    # csv.get_row_iterator will check key-properties exist in the csv
+    # so we need to give them the list minus the meta field such as SDC_SOURCE_FILE_COLUMN or others
+    reduced_table_spec = {}
+    reduced_table_spec["key_properties"] = table_spec.get("key_properties", []).copy()
+    if SDC_SOURCE_BUCKET_COLUMN in reduced_table_spec["key_properties"]:
+        reduced_table_spec["key_properties"].remove(SDC_SOURCE_BUCKET_COLUMN)
+    if SDC_SOURCE_FILE_COLUMN in reduced_table_spec["key_properties"]: 
+        reduced_table_spec["key_properties"].remove(SDC_SOURCE_FILE_COLUMN)
+    if SDC_SOURCE_LINENO_COLUMN in reduced_table_spec["key_properties"]: 
+        reduced_table_spec["key_properties"].remove(SDC_SOURCE_LINENO_COLUMN)
+
+
+    iterator = get_row_iterator(file_stream, reduced_table_spec) #pylint:disable=protected-access
 
     current_row = 0
 
@@ -203,7 +173,7 @@ def sample_files(config: Dict, table_spec: Dict, s3_files: Generator,
     :returns: Generator containing all samples as dicts
     """
     LOGGER.info("Sampling files (max files: %s)", max_files)
-    for s3_file in more_itertools.tail(max_files, s3_files):
+    for s3_file in itertools.islice(s3_files, max_files):
         LOGGER.info('Sampling %s (max records: %s, sample rate: %s)',
                     s3_file['key'],
                     max_records,
@@ -227,18 +197,18 @@ def get_input_files_for_table(config: Dict, table_spec: Dict, modified_since: st
         matcher = re.compile(pattern)
     except re.error as err:
         raise ValueError(
-            (f"search_pattern for table `{table_spec['table_name']}` is not a valid regular "
-             "expression. See https://docs.python.org/3.5/library/re.html#regular-expression-syntax"),
+            ("search_pattern for table `{}` is not a valid regular "
+             "expression. See "
+             "https://docs.python.org/3.5/library/re.html#regular-expression-syntax").format(table_spec['table_name']),
             pattern) from err
 
-    LOGGER.info('Checking bucket "%s" for keys matching "%s"', bucket, pattern)
-    LOGGER.info('Skipping files which have a LastModified value older than %s', modified_since)
+    LOGGER.info(
+        'Checking bucket "%s" for keys matching "%s"', bucket, pattern)
 
     matched_files_count = 0
     unmatched_files_count = 0
     max_files_before_log = 30000
-    for s3_object in sorted(list_files_in_bucket(bucket, prefix, aws_endpoint_url=config.get('aws_endpoint_url')),
-                            key=lambda item: item['LastModified'], reverse=False):
+    for s3_object in list_files_in_bucket(bucket, prefix, aws_endpoint_url=config.get('aws_endpoint_url')):
         key = s3_object['Key']
         last_modified = s3_object['LastModified']
 
@@ -270,11 +240,10 @@ def get_input_files_for_table(config: Dict, table_spec: Dict, modified_since: st
 
     if matched_files_count == 0:
         if prefix:
-            raise Exception(
-                f'No files found in bucket "{bucket}" that matches prefix "{prefix}" and pattern "{pattern}"'
-            )
+            raise Exception('No files found in bucket "{}" that matches prefix "{}" and pattern "{}"'
+                            .format(bucket, prefix, pattern))
 
-        raise Exception(f'No files found in bucket "{bucket}" that matches pattern "{pattern}"')
+        raise Exception('No files found in bucket "{}" that matches pattern "{}"'.format(bucket, pattern))
 
 
 @retry_pattern()
@@ -338,7 +307,30 @@ def get_file_handle(config: Dict, s3_path: str) -> Iterator:
     s3_object = s3_bucket.Object(s3_path)
     return s3_object.get()['Body']
 
-def stream_zip_decompress(stream):
-    buffer = jio.BytesIO(stream.read())
-    z = zipfile.ZipFile(buffer)
-    return z.open(z.infolist()[0])
+def get_file_stream(config: Dict, s3_path: str) -> Iterator:
+    """
+    Get file stream to the file located in the s3 path.
+    It automatically decompress the file if it is zipped.
+    :param config: tap config
+    :param s3_path: file path in S3
+    :return: file stream
+    """
+    file_handle = get_file_handle(config, s3_path)
+    # if csv is zipped, unzip it
+    stream = None
+    if s3_path.endswith('zip'):
+        LOGGER.info('decompress stream')
+        stream = stream_zip_decompress(file_handle._raw_stream)
+    else:
+        stream = file_handle._raw_stream
+    return stream
+
+def stream_zip_decompress(stream: Iterator) -> Iterator:
+    """
+    Decompress first file of a zipped file stream
+    :param stream: file stream
+    :return: uncompressed file stream
+    """
+    buffer = io.BytesIO(stream.read())
+    file = zipfile.ZipFile(buffer)
+    return file.open(file.infolist()[0])
