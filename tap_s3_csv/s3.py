@@ -9,7 +9,7 @@ import more_itertools
 import re
 import backoff
 import boto3
-import requires.io AS io
+import requires.io as io
 
 from botocore.exceptions import ClientError
 from singer_encodings.csv import get_row_iterator, SDC_EXTRA_COLUMN  # pylint:disable=no-name-in-module
