@@ -318,7 +318,7 @@ def get_file_stream(config: Dict, s3_path: str) -> Iterator:
     file_handle = get_file_handle(config, s3_path)
     # if csv is zipped, unzip it
     stream = None
-    if s3_path.endswith('zip'):
+    if s3_path.endswith('zip') or s3_path.endswith('gz'):
         LOGGER.info('decompress stream')
         stream = stream_zip_decompress(file_handle._raw_stream)
     else:
