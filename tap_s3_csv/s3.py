@@ -13,6 +13,7 @@ import copy
 import singer
 import io
 import zipfile
+import gzip
 
 from botocore.exceptions import ClientError
 from singer_encodings.csv import get_row_iterator, SDC_EXTRA_COLUMN  # pylint:disable=no-name-in-module
